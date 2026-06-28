@@ -1,3 +1,6 @@
+import streamlit as st
+import requests
+import json
 def _extract_json(text):
     """从模型输出里稳健地抠出 JSON —— 自动跳过 ```json 围栏和前言/后缀。"""
     start, end = text.find("{"), text.rfind("}")
