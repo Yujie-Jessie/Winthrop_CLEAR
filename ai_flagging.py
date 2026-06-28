@@ -16,7 +16,19 @@ def get_ai_flag(case_id, case_type, call_reason, priority, narrative, conn):
     if cached and cached[0]:
         return cached[0], cached[1]
 
-    prompt = f"""..."""  # 保持不变
+    prompt = f"""You are a public health triage assistant reviewing 911 call logs for behavioral health intervention.
+Analyze this case and decide whether it should be FLAGGED for follow-up by a public health social worker.
+Case details:
+- Type: {case_type}
+- Call Reason: {call_reason}
+- Priority: {priority}
+- Narrative: {narrative or "No narrative provided."}
+Respond ONLY with a valid JSON object in this exact format (no other text):
+{{"flag": "Yes", "reason": "brief one-sentence reason"}}
+Where "flag" must be exactly one of: "Yes", "No", "Not Sure"
+- Yes: clear behavioral health need requiring social worker follow-up
+- No: no behavioral health concern identified
+- Not Sure: some indicators present but more information needed"""
 
     api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
     cacheable = True       # 临时性失败不写死缓存,允许下次重试
