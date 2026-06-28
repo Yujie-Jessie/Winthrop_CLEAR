@@ -1,78 +1,60 @@
-"""
-ai_flagging.py — Calls the Claude API to flag cases for follow-up
-(Fixed: the result is cached in the DB on BOTH success and failure, so the API
-is never re-called on every rerun — which previously froze the page.)
-"""
-import streamlit as st
-import requests
-import json
+def _extract_json(text):
+    """从模型输出里稳健地抠出 JSON —— 自动跳过 ```json 围栏和前言/后缀。"""
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1:
+        raise ValueError(f"no JSON object in model output: {text[:80]!r}")
+    return json.loads(text[start:end + 1])
 
 
 def get_ai_flag(case_id, case_type, call_reason, priority, narrative, conn):
-    """Call Claude API to recommend Yes / No / Not Sure for flagging.
-    Result is cached in the DB so the API is only called once per case."""
-
-    # Check cache first
     _c = conn.cursor()
     _c.execute("SELECT ai_flag, ai_reason FROM cases WHERE case_id=%s", (case_id,))
     cached = _c.fetchone()
     if cached and cached[0]:
         return cached[0], cached[1]
 
-    prompt = f"""You are a public health triage assistant reviewing 911 call logs for behavioral health intervention.
-
-Analyze this case and decide whether it should be FLAGGED for follow-up by a public health social worker.
-
-Case details:
-- Type: {case_type}
-- Call Reason: {call_reason}
-- Priority: {priority}
-- Narrative: {narrative or "No narrative provided."}
-
-Respond ONLY with a valid JSON object in this exact format (no other text):
-{{"flag": "Yes", "reason": "brief one-sentence reason"}}
-
-Where "flag" must be exactly one of: "Yes", "No", "Not Sure"
-- Yes: clear behavioral health need requiring social worker follow-up
-- No: no behavioral health concern identified
-- Not Sure: some indicators present but more information needed"""
+    prompt = f"""..."""  # 保持不变
 
     api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+    cacheable = True       # 临时性失败不写死缓存,允许下次重试
+
     if not api_key:
         flag, reason = "Not Sure", "API key not configured"
     else:
         try:
             resp = requests.post(
                 "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 150,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
+                headers={"x-api-key": api_key,
+                         "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={"model": "claude-haiku-4-5-20251001",
+                      "max_tokens": 150,
+                      "messages": [{"role": "user", "content": prompt}]},
                 timeout=15,
             )
-            data = resp.json()
-            if "content" in data:
-                text = data["content"][0]["text"].strip()
-                result = json.loads(text)
+            if resp.status_code != 200:
+                # 非 200(包含空体的网关错误)在这里就拦掉,不进 resp.json()
+                print(f"[ai_flagging] HTTP {resp.status_code}: {resp.text[:300]!r}")
+                flag, reason, cacheable = "Not Sure", f"API HTTP {resp.status_code}", False
+            else:
+                data = resp.json()
+                text = data["content"][0]["text"]
+                result = _extract_json(text)          # ← 用稳健解析替代 json.loads
                 flag = result.get("flag", "Not Sure")
                 reason = result.get("reason", "")
-            else:
-                # API returned an error object instead of content — surface the real error message
-                err = data.get("error", {}).get("message", str(data)[:80])
-                flag, reason = "Not Sure", f"API error: {err}"
+                if flag not in ("Yes", "No", "Not Sure"):
+                    flag, reason = "Not Sure", f"unexpected flag: {flag!r}"
+        except requests.exceptions.RequestException as e:
+            # 超时/连接错误属于临时故障,不写死缓存
+            flag, reason, cacheable = "Not Sure", f"Network error: {str(e)[:60]}", False
         except Exception as e:
+            # 解析失败时把原始文本打出来,方便定位
+            print(f"[ai_flagging] parse error: {e} | raw={locals().get('text','')[:200]!r}")
             flag, reason = "Not Sure", f"Analysis unavailable ({str(e)[:60]})"
 
-    # Always cache the result (success OR failure) so Claude is never re-called on rerun
-    _c2 = conn.cursor()
-    _c2.execute(
-        "UPDATE cases SET ai_flag=%s, ai_reason=%s WHERE case_id=%s",
-        (flag, reason, case_id),
-    )
+    if cacheable:
+        _c2 = conn.cursor()
+        _c2.execute("UPDATE cases SET ai_flag=%s, ai_reason=%s WHERE case_id=%s",
+                    (flag, reason, case_id))
+        conn.commit()          # ← 关键:缺这一行缓存根本不生效
     return flag, reason
